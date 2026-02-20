@@ -40,6 +40,26 @@ services:
     networks:
       - mcp-network
 
+  rust-server:
+    build: ./rust-server
+    container_name: mcp-rust-server
+    ports:
+      - "8084:8084"
+    environment:
+      - SERVER_TYPE=rust
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+    healthcheck:
+      test: [ "CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8084/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - mcp-network
+
   python-server:
     build: ./python-server
     container_name: mcp-python-server

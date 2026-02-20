@@ -1,0 +1,23 @@
+[package]
+name = "mcp-rust-server"
+version = "0.1.0"
+edition = "2024"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[dependencies]
+mimalloc = { version = "0.1", default-features = false }
+anyhow = "1.0.97"
+axum = "0.8.4"
+chrono = { version = "0.4.41", features = ["clock"] }
+reqwest = { version = "0.12.15", default-features = false, features = ["rustls-tls"] }
+rmcp = { version = "0.8.0", features = ["server", "macros", "transport-streamable-http-server", "schemars"] }
+schemars = "1.0"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+tokio = { version = "1.44.1", features = ["macros", "rt-multi-thread", "time"] }

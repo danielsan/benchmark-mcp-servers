@@ -1,15 +1,16 @@
 # Multi-Language MCP Server Performance Benchmark
 
-A comprehensive experimental analysis comparing Model Context Protocol (MCP) server implementations across Java, Go, Node.js, and Python. Testing 3.9 million requests over three benchmark rounds to measure latency, throughput, resource efficiency, and production-readiness characteristics.
+A comprehensive experimental analysis comparing Model Context Protocol (MCP) server implementations across Java, Go, Node.js, Python, and Rust. Testing millions of requests over benchmark rounds to measure latency, throughput, resource efficiency, and production-readiness characteristics.
 
 ## Objective
 
-This repository contains the source code and benchmark suite for a comprehensive performance analysis of Model Context Protocol (MCP) server implementations across four major programming ecosystems:
+This repository contains the source code and benchmark suite for a comprehensive performance analysis of Model Context Protocol (MCP) server implementations across five major programming ecosystems:
 
 - **Java**: Spring Boot + Spring AI
 - **Go**: Official SDK
 - **Node.js**: Official SDK
 - **Python**: FastMCP
+- **Rust**: Official MCP Rust SDK (`rmcp`) + Axum + Tokio
 
 The goal is to provide empirical data to inform architectural decisions for production MCP deployments by measuring latency, throughput, resource consumption, and reliability.
 
@@ -33,6 +34,7 @@ benchmark-mcp-servers/
 ├── nodejs-server/  # SDK v1.26.0 (with CVE-2026-25536 mitigation)
 ├── python-server/  # FastMCP 2.12.0+ + FastAPI
 ├── benchmark/      # k6 load testing scripts and tools
+├── rust-server/    # Official MCP Rust SDK (`rmcp`) + Axum + Tokio server
 └── docker-compose.yml
 ```
 
@@ -69,6 +71,7 @@ The servers will be available at:
 - Go: `http://localhost:8081`
 - Python: `http://localhost:8082`
 - Node.js: `http://localhost:8083`
+- Rust: `http://localhost:8084`
 
 ### Run Load Tests
 
@@ -79,6 +82,20 @@ Run the complete benchmark suite (all servers) using the orchestration script:
 ```bash
 cd benchmark
 ./run_benchmark.sh
+```
+
+To run without Docker for the language servers (one local server at a time, same benchmark ports), use:
+
+```bash
+cd benchmark
+./run_benchmark.sh --no-docker
+```
+
+To change sustained benchmark duration, pass minutes with `--duration=N` (works with or without Docker):
+
+```bash
+cd benchmark
+./run_benchmark.sh --duration=1
 ```
 
 **Option 2: Manual Single Server Test**
@@ -95,5 +112,3 @@ k6 run -e SERVER_URL=http://localhost:8080/mcp benchmark.js
 ```bash
 docker-compose down
 ```
-
-
