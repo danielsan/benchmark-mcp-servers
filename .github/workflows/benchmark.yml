@@ -1,0 +1,177 @@
+name: MCP Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Sustained benchmark duration per server (minutes)"
+        required: true
+        default: "5"
+        type: string
+      servers:
+        description: "Servers to benchmark (space-separated subset of: python go nodejs java rust)"
+        required: false
+        default: "python go nodejs java rust"
+        type: string
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Validate inputs
+        run: |
+          if ! [[ "${{ inputs.duration }}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::duration must be a positive integer"
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install k6
+        run: |
+          sudo gpg --no-default-keyring \
+            --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
+            --keyserver hkp://keyserver.ubuntu.com:80 \
+            --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" \
+            | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update -qq
+          sudo apt-get install -y k6
+          k6 version
+
+      - name: Start mock-api
+        run: docker compose up -d mock-api
+
+      - name: Run benchmark
+        env:
+          SERVERS: ${{ inputs.servers }}
+          DURATION: ${{ inputs.duration }}
+        run: |
+          chmod +x benchmark/run_benchmark.sh
+
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          RESULTS_DIR="benchmark/results/$TIMESTAMP"
+          mkdir -p "$RESULTS_DIR"
+
+          for server in $SERVERS; do
+            echo "::group::Benchmarking $server"
+
+            declare -A PORTS=([python]=8082 [go]=8081 [nodejs]=8083 [java]=8080 [rust]=8084)
+            declare -A SERVICES=([python]=python-server [go]=go-server [nodejs]=nodejs-server [java]=java-server [rust]=rust-server)
+            declare -A CONTAINERS=([python]=mcp-python-server [go]=mcp-go-server [nodejs]=mcp-nodejs-server [java]=mcp-java-server [rust]=mcp-rust-server)
+
+            PORT=${PORTS[$server]}
+            SERVICE=${SERVICES[$server]}
+            CONTAINER=${CONTAINERS[$server]}
+            URL="http://localhost:$PORT/mcp"
+            SERVER_RESULTS="$RESULTS_DIR/$server"
+            mkdir -p "$SERVER_RESULTS"
+
+            # Stop any previously running server
+            docker compose stop python-server go-server nodejs-server java-server rust-server 2>/dev/null || true
+            sleep 2
+
+            # Start target server
+            echo "Starting $SERVICE..."
+            docker compose up -d "$SERVICE"
+
+            # Wait for health
+            echo "Waiting for $server to be ready..."
+            elapsed=0
+            until curl -sf -m 2 "http://localhost:$PORT/health" >/dev/null 2>&1 || \
+                  curl -sf -m 2 "http://localhost:$PORT/actuator/health" >/dev/null 2>&1 || \
+                  curl -sf -m 2 -X POST "$URL" \
+                    -H "Content-Type: application/json" \
+                    -H "Accept: application/json, text/event-stream" \
+                    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"health","version":"1.0"}}}' \
+                    >/dev/null 2>&1; do
+              sleep 1
+              elapsed=$((elapsed + 1))
+              if [ $elapsed -ge 90 ]; then
+                echo "::error::$server failed to start after 90s"
+                docker compose logs "$SERVICE" || true
+                break 2
+              fi
+            done
+            echo "$server is ready (${elapsed}s)"
+
+            # Warmup
+            for i in $(seq 1 10); do
+              curl -sf -X POST "$URL" \
+                -H "Content-Type: application/json" \
+                -H "Accept: application/json, text/event-stream" \
+                -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"warmup","version":"1.0"}}}' \
+                >/dev/null 2>&1 || true
+            done
+
+            # Collect Docker stats in background
+            python3 benchmark/collect_stats.py "$CONTAINER" "$SERVER_RESULTS/stats.json" 1.0 &
+            STATS_PID=$!
+            sleep 1
+
+            # Run k6
+            k6 run \
+              --env SERVER_URL="$URL" \
+              --env SERVER_NAME="$server" \
+              --env K6_DURATION="${DURATION}m" \
+              --env FETCH_ENDPOINT="http://localhost:1080/api" \
+              --env OUTPUT_PATH="$SERVER_RESULTS/k6.json" \
+              benchmark/benchmark.js \
+              2>&1 | tee "$SERVER_RESULTS/k6_console.log"
+
+            # Stop stats collector
+            kill "$STATS_PID" 2>/dev/null || true
+            wait "$STATS_PID" 2>/dev/null || true
+
+            echo "::endgroup::"
+          done
+
+          # Stop all servers
+          docker compose stop python-server go-server nodejs-server java-server rust-server 2>/dev/null || true
+
+          # Consolidate
+          python3 benchmark/consolidate.py "$RESULTS_DIR"
+
+          # Surface the results directory path for the upload step
+          echo "RESULTS_DIR=$RESULTS_DIR" >> "$GITHUB_ENV"
+
+      - name: Print summary
+        if: always()
+        run: |
+          SUMMARY=$(find benchmark/results -name summary.json | sort | tail -1)
+          if [ -n "$SUMMARY" ]; then
+            echo "### Benchmark Summary" >> "$GITHUB_STEP_SUMMARY"
+            echo '```json' >> "$GITHUB_STEP_SUMMARY"
+            python3 -c "
+          import json, sys
+          data = json.load(open('$SUMMARY'))
+          servers = data.get('servers', {})
+          print(f\"{'Server':<10} {'RPS':>8} {'Avg ms':>8} {'P95 ms':>8} {'CPU%':>7} {'MEM MB':>8}\")
+          print('-' * 56)
+          for name in ['python','go','nodejs','java','rust']:
+              s = servers.get(name)
+              if not s: continue
+              lat = s.get('http',{}).get('latency',{})
+              rps = s.get('http',{}).get('rps',0)
+              cpu = s.get('resources',{}).get('cpu',{}).get('avg',0)
+              mem = s.get('resources',{}).get('memory_mb',{}).get('avg',0)
+              print(f\"{name:<10} {rps:>8.1f} {lat.get('avg',0):>8.1f} {lat.get('p95',0):>8.1f} {cpu:>7.1f} {mem:>8.1f}\")
+          " >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ github.run_id }}
+          path: benchmark/results/
+          retention-days: 90
