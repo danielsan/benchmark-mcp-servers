@@ -6,11 +6,13 @@ import { textSummary } from 'https://jslib.k6.io/k6-summary/0.1.0/index.js';
 // ─── Configuration ───────────────────────────────────────────────────
 const SERVER_URL = __ENV.SERVER_URL || 'http://localhost:8080/mcp';
 const SERVER_NAME = __ENV.SERVER_NAME || 'unknown';
+const FETCH_ENDPOINT = __ENV.FETCH_ENDPOINT || 'http://mock-api:1080/api';
+const K6_DURATION = __ENV.K6_DURATION || '5m';
 
 export const options = {
     stages: [
         { duration: '10s', target: 10 },   // ramp-up
-        { duration: '5m', target: 10 },   // sustained load
+        { duration: K6_DURATION, target: 10 },   // sustained load
         { duration: '10s', target: 0 },    // ramp-down
     ],
     thresholds: {
@@ -149,7 +151,7 @@ const TOOLS = [
     },
     {
         name: 'fetch_external_data',
-        args: { endpoint: 'http://mock-api:1080/api' },
+        args: { endpoint: FETCH_ENDPOINT },
         metric: fetchDuration,
         checkName: 'fetch ok',
         check: (r) => r && r.result && r.result.content,
@@ -229,7 +231,7 @@ export function handleSummary(data) {
     const summary = {
         server: SERVER_NAME,
         timestamp: new Date().toISOString(),
-        config: { vus: 10, duration: '5m', server_url: SERVER_URL },
+        config: { vus: 10, duration: K6_DURATION, server_url: SERVER_URL },
         http: {
             total_requests: getValue(data, 'http_reqs', 'count', 0),
             failed_requests: getValue(data, 'http_req_failed', 'passes', 0),

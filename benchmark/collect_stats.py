@@ -7,6 +7,7 @@ Usage: python3 collect_stats.py <container_name> <output_file> [poll_interval_s]
 """
 
 import sys
+import os
 import json
 import time
 import signal
@@ -15,6 +16,20 @@ import urllib.error
 import http.client
 import socket
 from datetime import datetime, timezone
+
+
+DOCKER_SOCKET_PATHS = [
+    '/var/run/docker.sock',
+    os.path.expanduser('~/.docker/run/docker.sock'),
+    os.path.expanduser('~/.docker/desktop/docker.sock'),
+]
+
+
+def find_docker_socket():
+    for path in DOCKER_SOCKET_PATHS:
+        if os.path.exists(path):
+            return path
+    return DOCKER_SOCKET_PATHS[0]  # fall back to default so the error is descriptive
 
 
 class DockerStatsCollector:
@@ -26,12 +41,14 @@ class DockerStatsCollector:
         self.poll_interval = poll_interval
         self.samples = []
         self.running = True
+        self.docker_socket = find_docker_socket()
+        self._last_error = None  # suppress repeated identical errors
 
     def _docker_api_get(self, path):
         """Make a GET request to Docker Engine API via Unix socket."""
         conn = http.client.HTTPConnection('localhost')
         conn.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        conn.sock.connect('/var/run/docker.sock')
+        conn.sock.connect(self.docker_socket)
         conn.request('GET', path)
         response = conn.getresponse()
         data = response.read().decode('utf-8')
@@ -97,7 +114,10 @@ class DockerStatsCollector:
             self.samples.append(sample)
             return sample
         except Exception as e:
-            print(f"Error collecting stats: {e}", file=sys.stderr)
+            msg = str(e)
+            if msg != self._last_error:
+                print(f"Error collecting stats: {e}", file=sys.stderr)
+                self._last_error = msg
             return None
 
     def save(self):
@@ -136,7 +156,8 @@ class DockerStatsCollector:
         signal.signal(signal.SIGINT, lambda *_: setattr(self, 'running', False))
 
         print(f"Collecting stats for {self.container_name} → {self.output_file}")
-        print(f"Poll interval: {self.poll_interval}s. Send SIGTERM/SIGINT to stop.")
+        print(f"Poll interval: {self.poll_interval}s. Docker socket: {self.docker_socket}")
+        print(f"Send SIGTERM/SIGINT to stop.")
 
         while self.running:
             sample = self.collect_sample()

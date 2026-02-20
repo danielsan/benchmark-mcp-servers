@@ -1,11 +1,51 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# set -xe
 
 # ─── Configuration ────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 RESULTS_DIR="$SCRIPT_DIR/results/$TIMESTAMP"
+NO_DOCKER=false
+DURATION_MINUTES=5
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-docker)
+            NO_DOCKER=true
+            ;;
+        --duration=*)
+            DURATION_MINUTES="${1#*=}"
+            ;;
+        --duration)
+            if [ $# -lt 2 ]; then
+                echo "[ERR] Missing value for --duration" >&2
+                exit 1
+            fi
+            DURATION_MINUTES="$2"
+            shift
+            ;;
+        -h|--help)
+            echo "Usage: $0 [--no-docker] [--duration=N]"
+            echo "  --no-docker   Run each server locally (one at a time) instead of Docker containers"
+            echo "  --duration=N  Sustained benchmark duration in minutes (default: 5)"
+            exit 0
+            ;;
+        *)
+            echo "[ERR] Unknown option: $1" >&2
+            echo "Usage: $0 [--no-docker] [--duration=N]" >&2
+            exit 1
+            ;;
+    esac
+    shift
+done
+
+if ! [[ "$DURATION_MINUTES" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[ERR] --duration must be a positive integer number of minutes" >&2
+    exit 1
+fi
+K6_DURATION="${DURATION_MINUTES}m"
 
 # Servers to benchmark (name:container:port)
 declare -A SERVERS=(
@@ -13,8 +53,35 @@ declare -A SERVERS=(
     [go]="mcp-go-server:8081"
     [nodejs]="mcp-nodejs-server:8083"
     [java]="mcp-java-server:8080"
+    [rust]="mcp-rust-server:8084"
 )
-ALL_SERVICES="python-server go-server nodejs-server java-server"
+ALL_SERVICES="rust-server python-server go-server nodejs-server java-server"
+declare -A LOCAL_SERVER_DIRS=(
+    [python]="$PROJECT_DIR/python-server"
+    [go]="$PROJECT_DIR/go-server"
+    [nodejs]="$PROJECT_DIR/nodejs-server"
+    [java]="$PROJECT_DIR/java-server"
+    [rust]="$PROJECT_DIR/rust-server"
+)
+declare -A LOCAL_SERVER_CMDS=(
+    [python]="python3 -m uvicorn main:app --host 0.0.0.0 --port 8082"
+    [go]="go run main.go"
+    [nodejs]="node index.js"
+    [java]="gradle bootRun --no-daemon"
+    [rust]="PORT=8084 cargo run --release --quiet"
+)
+LOCAL_SERVER_PID=""
+
+if [ "$NO_DOCKER" = false ]; then
+    if docker compose version >/dev/null 2>&1; then
+        COMPOSE_CMD=(docker compose)
+    elif docker-compose --version >/dev/null 2>&1; then
+        COMPOSE_CMD=(docker-compose)
+    else
+        echo "[ERR] Docker Compose not found (docker compose or docker-compose)." >&2
+        exit 1
+    fi
+fi
 
 # Colors
 GREEN='\033[0;32m'
@@ -79,10 +146,25 @@ warmup() {
     ok "Warmup complete"
 }
 
+stop_local_server() {
+    if [ -n "$LOCAL_SERVER_PID" ] && kill -0 "$LOCAL_SERVER_PID" >/dev/null 2>&1; then
+        info "Stopping local MCP server process (pid=$LOCAL_SERVER_PID)..."
+        kill "$LOCAL_SERVER_PID" 2>/dev/null || true
+        wait "$LOCAL_SERVER_PID" 2>/dev/null || true
+    fi
+    LOCAL_SERVER_PID=""
+}
+
 stop_all_servers() {
+    if [ "$NO_DOCKER" = true ]; then
+        stop_local_server
+        ok "All local servers stopped"
+        return
+    fi
+
     info "Stopping all MCP server containers..."
     cd "$PROJECT_DIR"
-    docker compose stop $ALL_SERVICES 2>/dev/null || true
+    "${COMPOSE_CMD[@]}" stop $ALL_SERVICES 2>/dev/null || true
     sleep 2
     ok "All servers stopped"
 }
@@ -91,7 +173,19 @@ start_server() {
     local service=$1
     info "Starting $service..."
     cd "$PROJECT_DIR"
-    docker compose up -d "$service" 2>/dev/null
+    "${COMPOSE_CMD[@]}" up -d "$service" 2>/dev/null
+}
+
+start_local_server() {
+    local name=$1
+    local server_results=$2
+    local dir="${LOCAL_SERVER_DIRS[$name]}"
+    local cmd="${LOCAL_SERVER_CMDS[$name]}"
+    local log_file="$server_results/server.log"
+
+    info "Starting local $name server..."
+    "${BASH:-bash}" -lc "source ~/.bashrc >/dev/null 2>&1 || true; cd \"$dir\" && $cmd" > "$log_file" 2>&1 &
+    LOCAL_SERVER_PID=$!
 }
 
 benchmark_server() {
@@ -111,9 +205,18 @@ benchmark_server() {
     echo "  Container: $container | Port: $port | URL: $url"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
+    local fetch_endpoint="http://mock-api:1080/api"
+    if [ "$NO_DOCKER" = true ]; then
+        fetch_endpoint="http://localhost:$port/mcp"
+    fi
+
     # 1. Stop all servers, start only the target
     stop_all_servers
-    start_server "$service"
+    if [ "$NO_DOCKER" = true ]; then
+        start_local_server "$name" "$server_results"
+    else
+        start_server "$service"
+    fi
 
     # 2. Wait for health
     if ! wait_for_health "$port" "$name"; then
@@ -124,25 +227,35 @@ benchmark_server() {
     # 3. Warmup
     warmup "$url" "$name"
 
+    local stats_pid=""
     # 4. Start stats collector in background
-    info "Starting Docker stats collector..."
-    python3 "$SCRIPT_DIR/collect_stats.py" "$container" "$server_results/stats.json" 1.0 &
-    local stats_pid=$!
-    sleep 1
+    if [ "$NO_DOCKER" = true ]; then
+        info "Skipping Docker stats collector (--no-docker)"
+        printf '{"mode":"no-docker"}\n' > "$server_results/stats.json"
+    else
+        info "Starting Docker stats collector..."
+        python3 "$SCRIPT_DIR/collect_stats.py" "$container" "$server_results/stats.json" 1.0 &
+        stats_pid=$!
+        sleep 1
+    fi
 
     # 5. Run k6 benchmark
-    info "Running k6 benchmark (50 VUs, 5m)..."
+    info "Running k6 benchmark (10 VUs, $K6_DURATION)..."
     k6 run \
         --env SERVER_URL="$url" \
         --env SERVER_NAME="$name" \
+        --env K6_DURATION="$K6_DURATION" \
+        --env FETCH_ENDPOINT="$fetch_endpoint" \
         --env OUTPUT_PATH="$server_results/k6.json" \
         "$SCRIPT_DIR/benchmark.js" \
         2>&1 | tee "$server_results/k6_console.log"
 
     # 6. Stop stats collector
-    info "Stopping stats collector..."
-    kill "$stats_pid" 2>/dev/null || true
-    wait "$stats_pid" 2>/dev/null || true
+    if [ -n "$stats_pid" ]; then
+        info "Stopping stats collector..."
+        kill "$stats_pid" 2>/dev/null || true
+        wait "$stats_pid" 2>/dev/null || true
+    fi
 
     ok "Benchmark complete for ${name^^}"
 }
@@ -154,22 +267,27 @@ main() {
     echo "╔══════════════════════════════════════════════════════════════╗"
     echo "║           MCP SERVERS BENCHMARK SUITE                      ║"
     echo "╠══════════════════════════════════════════════════════════════╣"
-    echo "║  VUs: 10 | Duration: 5m | CPU: 1 core | RAM: 1GB          ║"
-    echo "║  Servers: python, go, nodejs, java                         ║"
+    echo "║  VUs: 10 | Duration: $K6_DURATION | CPU: 1 core | RAM: 1GB          ║"
+    echo "║  Servers: python, go, nodejs, java, rust                   ║"
+    echo "║  Mode: $( [ "$NO_DOCKER" = true ] && echo "local (--no-docker)" || echo "docker compose" )"
     echo "║  Results: $RESULTS_DIR"
     echo "╚══════════════════════════════════════════════════════════════╝"
     echo ""
 
     mkdir -p "$RESULTS_DIR"
 
-    # Ensure mock-api is running
-    info "Ensuring mock-api is running..."
-    cd "$PROJECT_DIR"
-    docker compose up -d mock-api 2>/dev/null
-    ok "mock-api is up"
+    if [ "$NO_DOCKER" = false ]; then
+        # Ensure mock-api is running
+        info "Ensuring mock-api is running..."
+        cd "$PROJECT_DIR"
+        "${COMPOSE_CMD[@]}" up -d mock-api 2>/dev/null
+        ok "mock-api is up"
+    else
+        info "Running in local mode (--no-docker); using per-server localhost fetch endpoint"
+    fi
 
     # Benchmark each server
-    for name in python go nodejs java; do
+    for name in python go nodejs java rust; do
         benchmark_server "$name" || warn "Failed to benchmark $name, continuing..."
     done
 
@@ -189,5 +307,13 @@ main() {
     echo "║  Summary: $RESULTS_DIR/summary.json"
     echo "╚══════════════════════════════════════════════════════════════╝"
 }
+
+cleanup() {
+    if [ "$NO_DOCKER" = true ]; then
+        stop_local_server
+    fi
+}
+
+trap cleanup EXIT INT TERM
 
 main "$@"

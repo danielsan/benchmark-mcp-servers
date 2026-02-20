@@ -9,7 +9,7 @@ import sys
 import os
 from datetime import datetime, timezone
 
-SERVERS = ['python', 'go', 'nodejs', 'java']
+SERVERS = ['python', 'go', 'nodejs', 'java', 'rust']
 
 
 def load_json(path):
@@ -119,7 +119,7 @@ def print_summary(summary):
     print(f"\n  {'Server':<10} {'RPS':>8} {'Avg(ms)':>8} {'P50(ms)':>8} {'P95(ms)':>8} {'P99(ms)':>8} {'CPU%':>7} {'MEM(MB)':>8}")
     print("  " + "-" * 67)
 
-    for name in ['python', 'go', 'nodejs', 'java']:
+    for name in ['python', 'go', 'nodejs', 'java', 'rust']:
         data = servers.get(name)
         if not data:
             continue
